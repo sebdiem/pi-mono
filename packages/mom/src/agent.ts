@@ -6,6 +6,7 @@ import {
 	convertToLlm,
 	createExtensionRuntime,
 	formatSkillsForPrompt,
+	getAgentDir,
 	loadSkillsFromDir,
 	ModelRegistry,
 	type ResourceLoader,
@@ -473,7 +474,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	// Use a fixed context.jsonl file per channel (not timestamped like coding-agent)
 	const contextFile = join(channelDir, "context.jsonl");
 	const sessionManager = SessionManager.open(contextFile, channelDir);
-	const settingsManager = new MomSettingsManager(join(channelDir, ".."));
+	const settingsManager = new MomSettingsManager(getAgentDir());
 
 	// Create AuthStorage and ModelRegistry
 	// Auth stored outside workspace so agent can't access it
