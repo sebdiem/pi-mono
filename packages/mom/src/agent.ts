@@ -1,5 +1,5 @@
 import { Agent, type AgentEvent } from "@mariozechner/pi-agent-core";
-import { getModel, type ImageContent } from "@mariozechner/pi-ai";
+import type { Api, ImageContent, Model } from "@mariozechner/pi-ai";
 import {
 	AgentSession,
 	AuthStorage,
@@ -23,8 +23,8 @@ import type { ChannelInfo, SlackContext, UserInfo } from "./slack.js";
 import type { ChannelStore } from "./store.js";
 import { createMomTools, setUploadFunction } from "./tools/index.js";
 
-// Hardcoded model for now - TODO: make configurable (issue #63)
-const model = getModel("anthropic", "claude-sonnet-4-5");
+const DEFAULT_PROVIDER = "anthropic";
+const DEFAULT_MODEL_ID = "claude-sonnet-4-5";
 
 export interface PendingMessage {
 	userName: string;
@@ -42,13 +42,62 @@ export interface AgentRunner {
 	abort(): void;
 }
 
-async function getAnthropicApiKey(authStorage: AuthStorage): Promise<string> {
-	const key = await authStorage.getApiKey("anthropic");
+function modelsEqual(a: Model<Api>, b: Model<Api>): boolean {
+	return a.provider === b.provider && a.id === b.id;
+}
+
+function resolveConfiguredModel(settingsManager: MomSettingsManager, modelRegistry: ModelRegistry): Model<Api> {
+	const configuredProvider = settingsManager.getDefaultProvider();
+	const configuredModelId = settingsManager.getDefaultModel();
+	const allModels = modelRegistry.getAll();
+	const availableModels = modelRegistry.getAvailable();
+
+	if (configuredProvider && configuredModelId) {
+		const exact = modelRegistry.find(configuredProvider, configuredModelId);
+		if (exact) return exact;
+		log.logWarning(
+			"Configured default model not found",
+			`${configuredProvider}/${configuredModelId} from settings.json`,
+		);
+	}
+
+	if (configuredProvider && !configuredModelId) {
+		const providerMatch =
+			availableModels.find((m) => m.provider === configuredProvider) ??
+			allModels.find((m) => m.provider === configuredProvider);
+		if (providerMatch) return providerMatch;
+		log.logWarning("Configured default provider not found", `${configuredProvider} from settings.json`);
+	}
+
+	if (!configuredProvider && configuredModelId) {
+		const modelIdMatch =
+			availableModels.find((m) => m.id === configuredModelId) ?? allModels.find((m) => m.id === configuredModelId);
+		if (modelIdMatch) return modelIdMatch;
+		log.logWarning("Configured default model ID not found", `${configuredModelId} from settings.json`);
+	}
+
+	if (availableModels.length > 0) {
+		return availableModels[0];
+	}
+
+	const fallbackModel = modelRegistry.find(DEFAULT_PROVIDER, DEFAULT_MODEL_ID);
+	if (fallbackModel) {
+		return fallbackModel;
+	}
+
+	if (allModels.length > 0) {
+		return allModels[0];
+	}
+
+	throw new Error("No models available in registry");
+}
+
+async function getApiKeyForModel(modelRegistry: ModelRegistry, model: Model<Api>, authPath: string): Promise<string> {
+	const key = await modelRegistry.getApiKey(model);
 	if (!key) {
 		throw new Error(
-			"No API key found for anthropic.\n\n" +
-				"Set an API key environment variable, or use /login with Anthropic and link to auth.json from " +
-				join(homedir(), ".pi", "mom", "auth.json"),
+			`No API key found for provider "${model.provider}".\n\n` +
+				`Set credentials via environment variable or auth.json:\n${authPath}`,
 		);
 	}
 	return key;
@@ -428,19 +477,22 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 	// Create AuthStorage and ModelRegistry
 	// Auth stored outside workspace so agent can't access it
-	const authStorage = AuthStorage.create(join(homedir(), ".pi", "mom", "auth.json"));
+	const authPath = join(homedir(), ".pi", "mom", "auth.json");
+	const authStorage = AuthStorage.create(authPath);
 	const modelRegistry = new ModelRegistry(authStorage);
+	let currentModel = resolveConfiguredModel(settingsManager, modelRegistry);
+	log.logInfo(`[${channelId}] Using model ${currentModel.provider}/${currentModel.id}`);
 
 	// Create agent
 	const agent = new Agent({
 		initialState: {
 			systemPrompt,
-			model,
+			model: currentModel,
 			thinkingLevel: "off",
 			tools,
 		},
 		convertToLlm,
-		getApiKey: async () => getAnthropicApiKey(authStorage),
+		getApiKey: async () => getApiKeyForModel(modelRegistry, currentModel, authPath),
 	});
 
 	// Load existing messages
@@ -662,6 +714,13 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				log.logInfo(`[${channelId}] Reloaded ${reloadedSession.messages.length} messages from context`);
 			}
 
+			const selectedModel = resolveConfiguredModel(settingsManager, modelRegistry);
+			if (!modelsEqual(selectedModel, currentModel)) {
+				currentModel = selectedModel;
+				session.agent.setModel(currentModel);
+				log.logInfo(`[${channelId}] Switched model to ${currentModel.provider}/${currentModel.id}`);
+			}
+
 			// Update system prompt with fresh memory, channel/user info, and skills
 			const memory = getMemory(channelDir);
 			const skills = loadMomSkills(channelDir, workspacePath);
@@ -841,7 +900,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 						lastAssistantMessage.usage.cacheRead +
 						lastAssistantMessage.usage.cacheWrite
 					: 0;
-				const contextWindow = model.contextWindow || 200000;
+				const contextWindow = currentModel.contextWindow || 200000;
 
 				const summary = log.logUsageSummary(runState.logCtx!, runState.totalUsage, contextTokens, contextWindow);
 				runState.queue.enqueue(() => ctx.respondInThread(summary), "usage summary");
