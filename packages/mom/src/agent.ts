@@ -480,7 +480,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	const authPath = join(homedir(), ".pi", "mom", "auth.json");
 	const authStorage = AuthStorage.create(authPath);
 	const modelRegistry = new ModelRegistry(authStorage);
-	let currentModel = resolveConfiguredModel(settingsManager, modelRegistry);
+	const currentModel = resolveConfiguredModel(settingsManager, modelRegistry);
 	log.logInfo(`[${channelId}] Using model ${currentModel.provider}/${currentModel.id}`);
 
 	// Create agent
@@ -492,7 +492,13 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			tools,
 		},
 		convertToLlm,
-		getApiKey: async () => getApiKeyForModel(modelRegistry, currentModel, authPath),
+		getApiKey: async () => {
+			const activeModel = agent.state.model as Model<Api> | undefined;
+			if (!activeModel) {
+				throw new Error("No active model selected");
+			}
+			return getApiKeyForModel(modelRegistry, activeModel, authPath);
+		},
 	});
 
 	// Load existing messages
@@ -715,11 +721,13 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			}
 
 			const selectedModel = resolveConfiguredModel(settingsManager, modelRegistry);
-			if (!modelsEqual(selectedModel, currentModel)) {
-				currentModel = selectedModel;
-				session.agent.setModel(currentModel);
-				log.logInfo(`[${channelId}] Switched model to ${currentModel.provider}/${currentModel.id}`);
+			const activeModel = session.agent.state.model as Model<Api>;
+			if (!modelsEqual(selectedModel, activeModel)) {
+				session.agent.setModel(selectedModel);
+				log.logInfo(`[${channelId}] Switched model to ${selectedModel.provider}/${selectedModel.id}`);
 			}
+			const runModel = session.agent.state.model as Model<Api>;
+			log.logInfo(`[${channelId}] Active model ${runModel.provider}/${runModel.id}`);
 
 			// Update system prompt with fresh memory, channel/user info, and skills
 			const memory = getMemory(channelDir);
@@ -900,7 +908,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 						lastAssistantMessage.usage.cacheRead +
 						lastAssistantMessage.usage.cacheWrite
 					: 0;
-				const contextWindow = currentModel.contextWindow || 200000;
+				const contextWindow = (session.agent.state.model as Model<Api>).contextWindow || 200000;
 
 				const summary = log.logUsageSummary(runState.logCtx!, runState.totalUsage, contextTokens, contextWindow);
 				runState.queue.enqueue(() => ctx.respondInThread(summary), "usage summary");
